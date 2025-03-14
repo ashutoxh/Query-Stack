@@ -6,8 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.neu.info7255.exception.SchemaValidationException;
 import edu.neu.info7255.validation.JsonSchemaValidator;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.data.redis.core.ReactiveHashOperations;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -49,31 +49,52 @@ public class PlanService {
      * @param planData The JSON data of the plan.
      * @return A Mono containing the ID if saved successfully, or an error if validation fails.
      */
-    public Mono<String> savePlan(String planId, JsonNode planData) {
+    public Mono<ResponseWithETag> savePlan(String planId, JsonNode planData) {
         try {
             // Validate the JSON data
             jsonSchemaValidator.validate(planData);
-        }
-        catch (SchemaValidationException e) {
+        } catch (SchemaValidationException e) {
             return Mono.error(new SchemaValidationException(e.getMessage(), e.getValidationErrors()));
         }
 
         // Generate a stable ETag based on the JSON data
         String etag = generateETag(planData);
 
+        String serializedData;
+
         try {
             // Serialize JSON data to a string for Redis storage
-            String serializedData = objectMapper.writeValueAsString(planData);
-
-            // Store both data and ETag in Redis
-            return hashOperations.putAll(planId, Map.of("data", serializedData, "etag", etag))
-                    .map(success -> success ? etag : null);
-
-        } catch (Exception e) {
-            return Mono.error(new RuntimeException("Failed to save plan", e));
+            serializedData = objectMapper.writeValueAsString(planData);
+        } catch (JsonProcessingException e) {
+            return Mono.error(new RuntimeException("Failed to serialize plan data", e));
         }
+
+        return hashOperations.entries(planId)
+                .collectMap(Map.Entry::getKey, Map.Entry::getValue)
+                .flatMap(existingFields -> {
+                    if (existingFields.isEmpty()) {
+                        // No existing data, save the new plan
+                        return saveNewData(planId, serializedData, etag)
+                                .map(savedEtag -> new ResponseWithETag(planData, savedEtag, false));
+                    }
+
+                    String existingData = existingFields.get("data");
+                    String existingEtag = existingFields.get("etag");
+                    if (existingData != null && existingData.equals(serializedData)) {
+                        // Data matches, return the existing ETag and data
+                        return Mono.just(new ResponseWithETag(planData, existingEtag, true));
+                    }
+
+                    // Data is different, update and return new ETag and data
+                    return saveNewData(planId, serializedData, etag)
+                            .map(savedEtag -> new ResponseWithETag(planData, savedEtag, false));
+                });
     }
 
+    private Mono<String> saveNewData(String planId, String serializedData, String etag) {
+        return hashOperations.putAll(planId, Map.of("data", serializedData, "etag", etag))
+                .thenReturn(etag);
+    }
 
     /**
      * Retrieve a plan by ID, using ETag for conditional read support.

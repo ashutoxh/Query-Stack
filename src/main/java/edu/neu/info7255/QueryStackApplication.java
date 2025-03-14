@@ -15,7 +15,7 @@ public class QueryStackApplication {
 	 * @param args the input arguments
 	 */
 	public static void main(String[] args) {
-		SpringApplication.run(QueryStackApplication.class, args);
-	}
+        SpringApplication.run(QueryStackApplication.class, args);
+    }
 
 }

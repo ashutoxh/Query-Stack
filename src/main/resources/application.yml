@@ -7,6 +7,14 @@ spring:
       port: 6379
       database: 0
       timeout: 60000ms
+  main:
+    banner-mode: off
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs    # Path to access the OpenAPI JSON
+  swagger-ui:
+    path: /swagger-ui.html  # Path to access the Swagger UI
 
 query-stack:
   schema-path: /schema/plan-schema.json

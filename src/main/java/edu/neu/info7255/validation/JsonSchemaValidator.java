@@ -13,12 +13,22 @@ import org.springframework.stereotype.Component;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
+/**
+ * The type Json schema validator.
+ */
 @Component
 public class JsonSchemaValidator {
 
     private final Schema schema;
     private final ObjectMapper objectMapper;
 
+    /**
+     * Instantiates a new Json schema validator.
+     *
+     * @param properties     the properties
+     * @param objectMapper   the object mapper
+     * @param resourceLoader the resource loader
+     */
     public JsonSchemaValidator(QueryStackProperties properties, ObjectMapper objectMapper, ResourceLoader resourceLoader) {
         this.objectMapper = objectMapper;
 
@@ -37,6 +47,11 @@ public class JsonSchemaValidator {
         }
     }
 
+    /**
+     * Validate.
+     *
+     * @param jsonData the json data
+     */
     public void validate(JsonNode jsonData) {
         try {
             // Convert JsonNode to JSONObject for validation
