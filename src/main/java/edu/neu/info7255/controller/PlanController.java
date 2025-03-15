@@ -159,7 +159,7 @@ public class PlanController {
     public Mono<ResponseEntity<CustomResponse>> patchPlan(
             @PathVariable String id,
             @RequestBody JsonNode patchData,
-            @RequestHeader(value = "If-None-Match", required = true) String clientETag) {
+            @RequestHeader(value = "If-None-Match", required = false) String clientETag) {
 
         return planService.patchPlan(id, patchData, clientETag)
                 .flatMap(response -> {
@@ -175,6 +175,8 @@ public class PlanController {
                                 .body(new CustomResponse(HttpStatus.OK, "Plan updated successfully", response.getData())));
                     }
                 })
+                .switchIfEmpty(Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND)
+                        .body(new CustomResponse(HttpStatus.NOT_FOUND, "Plan not found"))))
                 .onErrorResume(SchemaValidationException.class, e -> {
                     // Handle validation errors
                     List<String> validationErrors = e.getValidationErrors();

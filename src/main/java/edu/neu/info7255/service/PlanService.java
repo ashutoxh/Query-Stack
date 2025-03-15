@@ -3,6 +3,7 @@ package edu.neu.info7255.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import edu.neu.info7255.dto.CustomResponse;
 import edu.neu.info7255.exception.ETagMismatchException;
@@ -17,9 +18,7 @@ import reactor.core.publisher.Mono;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Base64;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.*;
 
 /**
  * The type Plan service.
@@ -31,13 +30,6 @@ public class PlanService {
     private final JsonSchemaValidator jsonSchemaValidator;
     private final ObjectMapper objectMapper;
 
-    /**
-     * Instantiates a new Plan service.
-     *
-     * @param reactiveRedisTemplate the reactive redis template
-     * @param jsonSchemaValidator   the json schema validator
-     * @param objectMapper          the object mapper
-     */
     @Autowired
     public PlanService(ReactiveRedisTemplate<String, String> reactiveRedisTemplate,
                        JsonSchemaValidator jsonSchemaValidator,
@@ -52,7 +44,7 @@ public class PlanService {
      *
      * @param planId   The unique ID of the plan.
      * @param planData The JSON data of the plan.
-     * @return A Mono containing the ID if saved successfully, or an error if validation fails.
+     * @return A Mono containing the response with the plan data and ETag.
      */
     public Mono<ResponseWithETag> savePlan(String planId, JsonNode planData) {
         try {
@@ -61,9 +53,6 @@ public class PlanService {
         } catch (SchemaValidationException e) {
             return Mono.error(new SchemaValidationException(e.getMessage(), e.getValidationErrors()));
         }
-
-        // Generate a stable ETag based on the JSON data
-        String etag = generateETag(planData);
 
         String serializedData;
 
@@ -79,26 +68,24 @@ public class PlanService {
                 .flatMap(existingFields -> {
                     if (existingFields.isEmpty()) {
                         // No existing data, save the new plan
-                        return saveNewData(planId, serializedData, etag)
-                                .map(savedEtag -> new ResponseWithETag(planData, savedEtag, false));
+                        return saveNewData(planId, serializedData)
+                                .thenReturn(new ResponseWithETag(planData, generateETag(planData), false));
                     }
 
                     String existingData = existingFields.get("data");
-                    String existingEtag = existingFields.get("etag");
                     if (existingData != null && existingData.equals(serializedData)) {
-                        // Data matches, return the existing ETag and data
-                        return Mono.just(new ResponseWithETag(planData, existingEtag, true));
+                        // Data matches, return the existing data and dynamically generated ETag
+                        return Mono.just(new ResponseWithETag(planData, generateETag(planData), true));
                     }
 
-                    // Data is different, update and return new ETag and data
-                    return saveNewData(planId, serializedData, etag)
-                            .map(savedEtag -> new ResponseWithETag(planData, savedEtag, false));
+                    // Data is different, update and return new data and dynamically generated ETag
+                    return saveNewData(planId, serializedData)
+                            .thenReturn(new ResponseWithETag(planData, generateETag(planData), false));
                 });
     }
 
-    private Mono<String> saveNewData(String planId, String serializedData, String etag) {
-        return hashOperations.putAll(planId, Map.of("data", serializedData, "etag", etag))
-                .thenReturn(etag);
+    private Mono<Void> saveNewData(String planId, String serializedData) {
+        return hashOperations.put(planId, "data", serializedData).then();
     }
 
     /**
@@ -109,29 +96,30 @@ public class PlanService {
      * @return A Mono containing the response with the plan data and ETag.
      */
     public Mono<ResponseWithETag> getPlanById(String planId, String clientETag) {
-        return hashOperations.entries(planId)
-                .collectMap(Map.Entry::getKey, Map.Entry::getValue)
-                .flatMap(entries -> {
-                    String data = entries.get("data");
-                    String storedETag = entries.get("etag");
-
-                    if (data == null || storedETag == null) {
+        return hashOperations.get(planId, "data")
+                .flatMap(data -> {
+                    if (data == null) {
                         return Mono.empty();  // Plan not found
                     }
 
-                    // Check for ETag match
-                    if (storedETag.equals(clientETag)) {
-                        return Mono.just(new ResponseWithETag(null, storedETag, true));
-                    }
-
-                    // Deserialize JSON data and return it with the ETag
-                    JsonNode planData = null;
+                    // Deserialize JSON data
+                    JsonNode planData;
                     try {
                         planData = objectMapper.readTree(data);
                     } catch (JsonProcessingException e) {
-                        throw new RuntimeException(e);
+                        return Mono.error(new RuntimeException("Failed to deserialize plan data", e));
                     }
-                    return Mono.just(new ResponseWithETag(planData, storedETag, false));
+
+                    // Generate the current ETag
+                    String currentETag = generateETag(planData);
+
+                    // Check for ETag match
+                    if (currentETag.equals(clientETag)) {
+                        return Mono.just(new ResponseWithETag(null, currentETag, true)); // Not Modified
+                    }
+
+                    // Return the plan data and current ETag
+                    return Mono.just(new ResponseWithETag(planData, currentETag, false));
                 });
     }
 
@@ -145,21 +133,19 @@ public class PlanService {
         return hashOperations.delete(planId);  // Directly return the boolean
     }
 
+    /**
+     * Partially update a plan by ID.
+     *
+     * @param planId     The unique ID of the plan.
+     * @param patchData  The partial JSON data to update.
+     * @param clientETag The client's ETag for conditional update.
+     * @return A Mono containing the response with the updated plan data and ETag.
+     */
     public Mono<ResponseWithETag> patchPlan(String planId, JsonNode patchData, String clientETag) {
-        return hashOperations.entries(planId)
-                .collectMap(Map.Entry::getKey, Map.Entry::getValue)
-                .flatMap(existingFields -> {
-                    String existingData = existingFields.get("data");
-                    String existingEtag = existingFields.get("etag");
-
-                    if (existingData == null || existingEtag == null) {
-                        // Plan not found
+        return hashOperations.get(planId, "data")
+                .flatMap(existingData -> {
+                    if (existingData == null) {
                         return Mono.error(new RuntimeException("Plan not found"));
-                    }
-
-                    // Check if the provided ETag matches the current ETag
-                    if (!existingEtag.equals(clientETag)) {
-                        return Mono.error(new ETagMismatchException("ETag mismatch"));
                     }
 
                     // Deserialize the existing plan data
@@ -168,6 +154,14 @@ public class PlanService {
                         existingPlanData = objectMapper.readTree(existingData);
                     } catch (JsonProcessingException e) {
                         return Mono.error(new RuntimeException("Failed to deserialize existing plan data", e));
+                    }
+
+                    // Generate the current ETag
+                    String currentETag = generateETag(existingPlanData);
+
+                    // Check if the provided ETag matches the current ETag
+                    if (!currentETag.equals(clientETag)) {
+                        return Mono.error(new ETagMismatchException("ETag mismatch"));
                     }
 
                     // Validate the partial JSON data
@@ -180,10 +174,13 @@ public class PlanService {
                     // Merge the patch data with the existing data
                     JsonNode updatedPlanData = mergePatch(existingPlanData, patchData);
 
-                    if(updatedPlanData.equals(existingPlanData))
-                        return Mono.just(new ResponseWithETag(existingPlanData, clientETag, true));
+                    // Check if the data was modified
+                    if (updatedPlanData.equals(existingPlanData)) {
+                        return Mono.just(new ResponseWithETag(existingPlanData, currentETag, true)); // Not Modified
+                    }
+
                     // Generate a new ETag for the updated plan
-                    String newEtag = generateETag(updatedPlanData);
+                    String newETag = generateETag(updatedPlanData);
 
                     // Serialize the updated plan data
                     String serializedUpdatedData;
@@ -194,35 +191,84 @@ public class PlanService {
                     }
 
                     // Save the updated plan and return the response
-                    return saveNewData(planId, serializedUpdatedData, newEtag)
-                            .map(savedEtag -> new ResponseWithETag(updatedPlanData, savedEtag, false));
+                    return saveNewData(planId, serializedUpdatedData)
+                            .thenReturn(new ResponseWithETag(updatedPlanData, newETag, false));
                 });
     }
 
-    /**
-     * Merges the patch data with the existing data.
-     */
     private JsonNode mergePatch(JsonNode existingData, JsonNode patchData) {
         // Create a deep copy of the existing data
         ObjectNode mergedData = existingData.deepCopy();
 
-        // Iterate over the fields in the patch data and merge them into the copied data
-        Iterator<Map.Entry<String, JsonNode>> fields = patchData.fields();
-        while (fields.hasNext()) {
-            Map.Entry<String, JsonNode> field = fields.next();
-            mergedData.set(field.getKey(), field.getValue());
-        }
+        // Merge the patch data into the existing data
+        mergeJsonNodes(mergedData, patchData);
 
         return mergedData;
     }
 
+    private void mergeJsonNodes(ObjectNode target, JsonNode patchNode) {
+        // Iterate over the fields in the patch data
+        patchNode.fields().forEachRemaining(field -> {
+            String fieldName = field.getKey();
+            JsonNode patchValue = field.getValue();
+
+            // Handle objects recursively
+            if (patchValue.isObject()) {
+                if (target.has(fieldName)) {
+                    // If the target has the field and it's also an object, merge recursively
+                    if (target.get(fieldName).isObject()) {
+                        mergeJsonNodes((ObjectNode) target.get(fieldName), patchValue);
+                    } else {
+                        // If the target field is not an object, replace it
+                        target.set(fieldName, patchValue.deepCopy());
+                    }
+                } else {
+                    // If the target doesn't have the field, add it
+                    target.set(fieldName, patchValue.deepCopy());
+                }
+            }
+            // Handle arrays by appending new items
+            else if (patchValue.isArray()) {
+                if (target.has(fieldName)) {
+                    // If the target has the field and it's also an array, merge arrays
+                    if (target.get(fieldName).isArray()) {
+                        ArrayNode targetArray = (ArrayNode) target.get(fieldName);
+                        ArrayNode patchArray = (ArrayNode) patchValue;
+                        mergeArrays(targetArray, patchArray);
+                    } else {
+                        // If the target field is not an array, replace it
+                        target.set(fieldName, patchValue.deepCopy());
+                    }
+                } else {
+                    // If the target doesn't have the field, add it
+                    target.set(fieldName, patchValue.deepCopy());
+                }
+            }
+            // Handle non-object and non-array values (replace existing value)
+            else {
+                target.set(fieldName, patchValue);
+            }
+        });
+    }
+
+    private void mergeArrays(ArrayNode target, ArrayNode patchArray) {
+        // Convert the target array to a Set for quick lookup
+        Set<JsonNode> targetSet = new HashSet<>();
+        target.forEach(targetSet::add);
+
+        // Append items from the patch array that don't already exist in the target array
+        patchArray.forEach(patchItem -> {
+            if (!targetSet.contains(patchItem)) {
+                target.add(patchItem.deepCopy());
+            }
+        });
+    }
+
     /**
      * Generate a stable ETag from the JSON content.
+     *
      * @param planData The JSON data.
      * @return A unique ETag string.
-     */
-    /**
-     * Generates a stable SHA-256-based ETag for the given JSON data.
      */
     private String generateETag(JsonNode planData) {
         try {
