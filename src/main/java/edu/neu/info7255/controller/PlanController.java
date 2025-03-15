@@ -2,6 +2,7 @@ package edu.neu.info7255.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import edu.neu.info7255.dto.CustomResponse;
+import edu.neu.info7255.exception.ETagMismatchException;
 import edu.neu.info7255.exception.SchemaValidationException;
 import edu.neu.info7255.service.PlanService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -16,7 +17,6 @@ import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
-import java.util.Map;
 
 /**
  * The type Plan controller.
@@ -144,5 +144,52 @@ public class PlanController {
                 })
                 .defaultIfEmpty(ResponseEntity.status(HttpStatus.NOT_FOUND)
                         .body(new CustomResponse(HttpStatus.NOT_FOUND, "Plan not found")));
+    }
+
+    @PatchMapping("/{id}")
+    @Operation(summary = "Partially update a plan", description = "Updates specific fields of a plan if the provided ETag is valid.")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Plan updated successfully"),
+            @ApiResponse(responseCode = "304", description = "Nothing to modify"),
+            @ApiResponse(responseCode = "400", description = "Invalid input or ETag mismatch"),
+            @ApiResponse(responseCode = "404", description = "Plan not found"),
+            @ApiResponse(responseCode = "412", description = "ETag required or invalid"),
+            @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public Mono<ResponseEntity<CustomResponse>> patchPlan(
+            @PathVariable String id,
+            @RequestBody JsonNode patchData,
+            @RequestHeader(value = "If-None-Match", required = true) String clientETag) {
+
+        return planService.patchPlan(id, patchData, clientETag)
+                .flatMap(response -> {
+                    if (response.isNotModified()) {
+                        // Return 304 Not Modified
+                        return Mono.just(ResponseEntity.status(HttpStatus.NOT_MODIFIED)
+                                .eTag(response.getETag())
+                                .body(new CustomResponse(HttpStatus.NOT_MODIFIED, "Nothing to modify")));
+                    } else {
+                        // Return 200 OK with the updated plan
+                        return Mono.just(ResponseEntity.ok()
+                                .eTag(response.getETag())
+                                .body(new CustomResponse(HttpStatus.OK, "Plan updated successfully", response.getData())));
+                    }
+                })
+                .onErrorResume(SchemaValidationException.class, e -> {
+                    // Handle validation errors
+                    List<String> validationErrors = e.getValidationErrors();
+                    return Mono.just(ResponseEntity.badRequest()
+                            .body(new CustomResponse(HttpStatus.BAD_REQUEST, e.getMessage(), validationErrors)));
+                })
+                .onErrorResume(ETagMismatchException.class, e -> {
+                    // Handle ETag mismatch
+                    return Mono.just(ResponseEntity.status(HttpStatus.PRECONDITION_FAILED)
+                            .body(new CustomResponse(HttpStatus.PRECONDITION_FAILED, e.getMessage())));
+                })
+                .onErrorResume(e -> {
+                    // Handle generic errors
+                    return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                            .body(new CustomResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to update plan")));
+                });
     }
 }

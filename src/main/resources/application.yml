@@ -7,8 +7,17 @@ spring:
       port: 6379
       database: 0
       timeout: 60000ms
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://accounts.google.com
   main:
     banner-mode: off
+
+#logging:
+#  level:
+#    org.springframework.security: DEBUG
 
 springdoc:
   api-docs:
