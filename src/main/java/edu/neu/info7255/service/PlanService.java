@@ -5,14 +5,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import edu.neu.info7255.dto.CustomResponse;
+import edu.neu.info7255.config.RabbitMQConfig;
 import edu.neu.info7255.exception.ETagMismatchException;
 import edu.neu.info7255.exception.SchemaValidationException;
+import edu.neu.info7255.model.PlanIndexMessage;
 import edu.neu.info7255.validation.JsonSchemaValidator;
+import org.springframework.amqp.core.AmqpTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.ReactiveHashOperations;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -29,14 +30,17 @@ public class PlanService {
     private final ReactiveHashOperations<String, String, String> hashOperations;
     private final JsonSchemaValidator jsonSchemaValidator;
     private final ObjectMapper objectMapper;
+    private final AmqpTemplate amqp;
 
     @Autowired
     public PlanService(ReactiveRedisTemplate<String, String> reactiveRedisTemplate,
                        JsonSchemaValidator jsonSchemaValidator,
-                       ObjectMapper objectMapper) {
+                       ObjectMapper objectMapper,
+                       AmqpTemplate amqp) {
         this.hashOperations = reactiveRedisTemplate.opsForHash();
         this.jsonSchemaValidator = jsonSchemaValidator;
         this.objectMapper = objectMapper;
+        this.amqp = amqp;
     }
 
     /**
@@ -68,7 +72,8 @@ public class PlanService {
                 .flatMap(existingFields -> {
                     if (existingFields.isEmpty()) {
                         // No existing data, save the new plan
-                        return saveNewData(planId, serializedData)
+                        publish(PlanIndexMessage.Operation.CREATE, planId, serializedData);
+                        return saveNewData(planId, serializedData, planData)
                                 .thenReturn(new ResponseWithETag(planData, generateETag(planData), false));
                     }
 
@@ -79,12 +84,13 @@ public class PlanService {
                     }
 
                     // Data is different, update and return new data and dynamically generated ETag
-                    return saveNewData(planId, serializedData)
+                    publish(PlanIndexMessage.Operation.CREATE, planId, serializedData);
+                    return saveNewData(planId, serializedData, planData)
                             .thenReturn(new ResponseWithETag(planData, generateETag(planData), false));
                 });
     }
 
-    private Mono<Void> saveNewData(String planId, String serializedData) {
+    private Mono<Void> saveNewData(String planId, String serializedData, JsonNode planData) {
         return hashOperations.put(planId, "data", serializedData).then();
     }
 
@@ -130,6 +136,7 @@ public class PlanService {
      * @return A Mono indicating if the deletion was successful.
      */
     public Mono<Boolean> deletePlanById(String planId) {
+        publish(PlanIndexMessage.Operation.DELETE, planId, null);
         return hashOperations.delete(planId);  // Directly return the boolean
     }
 
@@ -191,7 +198,8 @@ public class PlanService {
                     }
 
                     // Save the updated plan and return the response
-                    return saveNewData(planId, serializedUpdatedData)
+                    publish(PlanIndexMessage.Operation.PATCH, planId, serializedUpdatedData);
+                    return saveNewData(planId, serializedUpdatedData, updatedPlanData)
                             .thenReturn(new ResponseWithETag(updatedPlanData, newETag, false));
                 });
     }
@@ -264,6 +272,12 @@ public class PlanService {
         });
     }
 
+    private void publish(PlanIndexMessage.Operation op, String id, String json) {
+        amqp.convertAndSend(RabbitMQConfig.PLAN_EXCHANGE,
+                "plan." + op.name().toLowerCase(),
+                new PlanIndexMessage(id, json, op));
+    }
+
     /**
      * Generate a stable ETag from the JSON content.
      *
@@ -327,5 +341,6 @@ public class PlanService {
         public boolean isNotModified() {
             return notModified;
         }
+
     }
 }
